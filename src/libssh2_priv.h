@@ -873,6 +873,9 @@ struct _LIBSSH2_SESSION {
     unsigned char *userauth_pblc_packet;
     size_t userauth_pblc_packet_len;
     char *userauth_pblc_method;
+    unsigned char *userauth_pblc_pubkey;
+    size_t userauth_pblc_pubkey_len;
+    int userauth_pblc_attempts;
     unsigned char *userauth_pblc_s;
     unsigned char *userauth_pblc_b;
     struct packet_requirev_state userauth_pblc_packet_requirev_state;

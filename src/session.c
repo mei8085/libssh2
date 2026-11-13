@@ -979,6 +979,8 @@ static int session_free(LIBSSH2_SESSION *session)
         SSH2_FREE(session, session->userauth_pblc_packet);
     if(session->userauth_pblc_method)
         SSH2_FREE(session, session->userauth_pblc_method);
+    if(session->userauth_pblc_pubkey)
+        SSH2_FREE(session, session->userauth_pblc_pubkey);
     if(session->userauth_kybd_data)
         SSH2_FREE(session, session->userauth_kybd_data);
     if(session->userauth_kybd_packet)

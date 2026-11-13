@@ -1376,13 +1376,23 @@ int ssh2_userauth_publickey(
     };
     int rc;
     unsigned char *s;
-    int auth_attempts = 0;
+    int fallback_retry = 0;
     size_t method_len;
 
 retry_auth:
-    auth_attempts++;
 
     if(session->userauth_pblc_state == ssh2_NB_state_idle) {
+        /*
+         * Count the tries of this authentication attempt in the session so
+         * that the signing algorithm fallback below keeps its state across
+         * non-blocking restarts of this function. A fresh attempt (as
+         * opposed to an algorithm fallback within the same attempt) resets
+         * the counter.
+         */
+        if(!fallback_retry)
+            session->userauth_pblc_attempts = 0;
+        session->userauth_pblc_attempts++;
+
         /*
          * The call to ssh2_ntohu32() later relies on pubkeydata having at
          * least 4 valid bytes containing the length of the method name.
@@ -1440,7 +1450,7 @@ retry_auth:
         /* upgrade key signing algo if it is supported and
          * it is our first auth attempt, otherwise fallback to
          * the key default algo */
-        if(auth_attempts == 1) {
+        if(session->userauth_pblc_attempts == 1) {
             rc = userauth_key_sign_algs(session,
                                         &session->userauth_pblc_method);
             if(rc) {
@@ -1448,6 +1458,23 @@ retry_auth:
                 return rc;
             }
         }
+
+        /*
+         * Keep a copy of the public key blob for the lifetime of this
+         * authentication attempt. The caller may release its own copy while
+         * a non-blocking attempt is still in progress, and the blob is
+         * needed to verify that the server's SSH_MSG_USERAUTH_PK_OK reply
+         * confirms the exact key and algorithm offered in this attempt.
+         */
+        SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
+        session->userauth_pblc_pubkey = SSH2_ALLOC(session, pubkeydata_len);
+        if(!session->userauth_pblc_pubkey) {
+            SSH2_SAFEFREE(session, session->userauth_pblc_method);
+            return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                            "Unable to allocate memory for public key data");
+        }
+        memcpy(session->userauth_pblc_pubkey, pubkeydata, pubkeydata_len);
+        session->userauth_pblc_pubkey_len = pubkeydata_len;
 
         if(session->userauth_pblc_method && *session->userauth_pblc_method) {
             ssh2_deb((session, LIBSSH2_TRACE_KEX, "Signing using %s",
@@ -1479,6 +1506,7 @@ retry_auth:
                                 4 + pubkeydata_len);
         if(!session->userauth_pblc_packet) {
             SSH2_SAFEFREE(session, session->userauth_pblc_method);
+            SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
             return ssh2_err(session, LIBSSH2_ERROR_ALLOC, "Out of memory");
         }
 
@@ -1508,6 +1536,7 @@ retry_auth:
         else if(rc) {
             SSH2_SAFEFREE(session, session->userauth_pblc_packet);
             SSH2_SAFEFREE(session, session->userauth_pblc_method);
+            SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
             session->userauth_pblc_state = ssh2_NB_state_idle;
             return ssh2_err(session, LIBSSH2_ERROR_SOCKET_SEND,
                             "Unable to send userauth-publickey request");
@@ -1528,39 +1557,89 @@ retry_auth:
         else if(rc || session->userauth_pblc_data_len < 1) {
             SSH2_SAFEFREE(session, session->userauth_pblc_packet);
             SSH2_SAFEFREE(session, session->userauth_pblc_method);
+            SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
             session->userauth_pblc_state = ssh2_NB_state_idle;
             return ssh2_err(session, LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED,
                             "Waiting for USERAUTH response");
         }
 
         if(session->userauth_pblc_data[0] == SSH_MSG_USERAUTH_SUCCESS) {
-            ssh2_deb((session, LIBSSH2_TRACE_AUTH,
-                      "Pubkey authentication prematurely successful"));
             /*
-             * God help any SSH server that allows an UNVERIFIED
-             * public key to validate the user
+             * The server claims the key alone is enough. Do not treat the
+             * probe phase as a completed authentication: continue and prove
+             * possession of the private key with a signed request, and only
+             * accept the reply to that signed request as success.
              */
+            ssh2_deb((session, LIBSSH2_TRACE_AUTH,
+                      "Pubkey authentication prematurely successful, "
+                      "continuing with signed request"));
             SSH2_SAFEFREE(session, session->userauth_pblc_data);
-            SSH2_SAFEFREE(session, session->userauth_pblc_packet);
-            SSH2_SAFEFREE(session, session->userauth_pblc_method);
-            session->state |= SSH2_STATE_AUTHENTICATED;
-            session->userauth_pblc_state = ssh2_NB_state_idle;
-            return 0;
         }
-
-        if(session->userauth_pblc_data[0] == SSH_MSG_USERAUTH_FAILURE) {
+        else if(session->userauth_pblc_data[0] == SSH_MSG_USERAUTH_FAILURE) {
             /* This public key is not allowed for this user on this server */
             SSH2_SAFEFREE(session, session->userauth_pblc_data);
             SSH2_SAFEFREE(session, session->userauth_pblc_packet);
             SSH2_SAFEFREE(session, session->userauth_pblc_method);
+            SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
             session->userauth_pblc_state = ssh2_NB_state_idle;
             return ssh2_err(session, LIBSSH2_ERROR_AUTHENTICATION_FAILED,
                             "Username/PublicKey combination invalid");
         }
+        else {
+            /*
+             * SSH_MSG_USERAUTH_PK_OK: the reply must confirm the exact
+             * algorithm and public key blob offered in this attempt.
+             * Anything else means the confirmation does not belong to the
+             * key we are about to sign with, so refuse to sign.
+             */
+            unsigned char *p = session->userauth_pblc_data + 1;
+            size_t remain = session->userauth_pblc_data_len - 1;
+            size_t algo_len;
+            size_t key_len;
+            int confirmed = 0;
+
+            method_len = strlen(session->userauth_pblc_method);
+
+            if(remain >= 4) {
+                algo_len = ssh2_ntohu32(p);
+                p += 4;
+                remain -= 4;
+                if(algo_len <= remain) {
+                    if(algo_len == method_len &&
+                       !memcmp(p, session->userauth_pblc_method,
+                               method_len)) {
+                        p += algo_len;
+                        remain -= algo_len;
+                        if(remain >= 4) {
+                            key_len = ssh2_ntohu32(p);
+                            p += 4;
+                            remain -= 4;
+                            if(key_len == remain &&
+                               key_len ==
+                               session->userauth_pblc_pubkey_len &&
+                               !memcmp(p, session->userauth_pblc_pubkey,
+                                       key_len))
+                                confirmed = 1;
+                        }
+                    }
+                }
+            }
+
+            if(!confirmed) {
+                SSH2_SAFEFREE(session, session->userauth_pblc_data);
+                SSH2_SAFEFREE(session, session->userauth_pblc_packet);
+                SSH2_SAFEFREE(session, session->userauth_pblc_method);
+                SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
+                session->userauth_pblc_state = ssh2_NB_state_idle;
+                return ssh2_err(session, LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED,
+                                "Server's public key confirmation does not "
+                                "match the offered key and algorithm");
+            }
+
+            SSH2_SAFEFREE(session, session->userauth_pblc_data);
+        }
 
         /* Semi-Success! */
-        SSH2_SAFEFREE(session, session->userauth_pblc_data);
-
         *session->userauth_pblc_b = 0x01;
         session->userauth_pblc_state = ssh2_NB_state_sent1;
     }
@@ -1587,8 +1666,14 @@ retry_auth:
         SSH2_FREE(session, buf);
         if(rc == LIBSSH2_ERROR_EAGAIN)
             return ssh2_err(session, LIBSSH2_ERROR_EAGAIN, "Would block");
-        else if(rc == LIBSSH2_ERROR_ALGO_UNSUPPORTED && auth_attempts == 1) {
-            /* try again with the default key algo */
+        else if(rc == LIBSSH2_ERROR_ALGO_UNSUPPORTED &&
+                session->userauth_pblc_attempts == 1) {
+            /*
+             * Try again with the default key algo. This restarts the whole
+             * attempt, including a fresh probe and a fresh confirmation,
+             * while the attempt counter survives non-blocking restarts.
+             */
+            fallback_retry = 1;
             SSH2_SAFEFREE(session, session->userauth_pblc_method);
             SSH2_SAFEFREE(session, session->userauth_pblc_packet);
             session->userauth_pblc_state = ssh2_NB_state_idle;
@@ -1598,6 +1683,7 @@ retry_auth:
         else if(rc) {
             SSH2_SAFEFREE(session, session->userauth_pblc_method);
             SSH2_SAFEFREE(session, session->userauth_pblc_packet);
+            SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
             session->userauth_pblc_state = ssh2_NB_state_idle;
             return ssh2_err(session, LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED,
                             "Callback returned error");
@@ -1622,6 +1708,7 @@ retry_auth:
                 SSH2_FREE(session, sig);
                 SSH2_SAFEFREE(session, session->userauth_pblc_packet);
                 SSH2_SAFEFREE(session, session->userauth_pblc_method);
+                SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
                 session->userauth_pblc_state = ssh2_NB_state_idle;
                 return ssh2_err(session, LIBSSH2_ERROR_ALLOC,
                                 "Failed allocating additional space for "
@@ -1655,6 +1742,7 @@ retry_auth:
         }
 
         SSH2_SAFEFREE(session, session->userauth_pblc_method);
+        SSH2_SAFEFREE(session, session->userauth_pblc_pubkey);
         SSH2_FREE(session, sig);
 
         ssh2_deb((session, LIBSSH2_TRACE_AUTH,
