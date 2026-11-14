@@ -3620,6 +3620,12 @@ int ssh2_kex_exchange(LIBSSH2_SESSION *session, int reexchange,
             session->hostkey = NULL;
         }
 
+        /* Reset strict key exchange state so that state negotiated during
+           a previous (possibly terminated) exchange is not carried over
+           into this one */
+        session->kex_strict = 0;
+        session->burn_optimistic_kexinit = 0;
+
         key_state->state = ssh2_NB_state_created;
     }
 
