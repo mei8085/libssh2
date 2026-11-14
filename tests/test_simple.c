@@ -232,6 +232,358 @@ static int test_knownhost_ipv6(LIBSSH2_SESSION *session)
     return err > 0;
 }
 
+/*
+ * Verify OpenSSH known_hosts marker handling ("@revoked" and
+ * "@cert-authority"). Markers change the trust semantics of a line and must
+ * be validated on read, preserved on write, and never cause a revoked key to
+ * be trusted or a CA entry to match as a plain host key.
+ */
+
+/* a real ed25519 public key, split into type and base64 blob */
+#define KH_KEY_TYPE "ssh-ed25519"
+#define KH_KEY_BLOB \
+    "AAAAC3NzaC1lZDI1NTE5AAAAIG9F8NzMYV6LbV6QgxP5FW6bUNnYAP7xvMDa7+UdBsrL"
+/* a different blob, used to simulate a host key change */
+#define KH_KEY_OTHER \
+    "AAAAC3NzaC1lZDI1NTE5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+/* an OpenSSH hashed representation of the host name "example.com" */
+#define KH_HASHED_HOST \
+    "|1|BBT1v5bvnL9TzbQw56WDoXca248=|UEmm6nyFNdVagfPj1LC5WkLFVAw="
+
+#define KH_TYPEMASK (LIBSSH2_KNOWNHOST_TYPE_PLAIN | \
+                     LIBSSH2_KNOWNHOST_KEYENC_BASE64 | \
+                     LIBSSH2_KNOWNHOST_KEY_ED25519)
+
+static int kh_read_line(LIBSSH2_KNOWNHOSTS *hosts, const char *line)
+{
+    return libssh2_knownhost_readline(hosts, line, strlen(line),
+                                      LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+}
+
+static int kh_check(LIBSSH2_KNOWNHOSTS *hosts, const char *host,
+                    const char *blob)
+{
+    return libssh2_knownhost_check(hosts, host, blob, strlen(blob),
+                                   KH_TYPEMASK, NULL);
+}
+
+/* read all lines, failing the test on the first parser error */
+static int kh_read_all(LIBSSH2_KNOWNHOSTS *hosts, const char *const *lines,
+                       int count)
+{
+    int i;
+    for(i = 0; i < count; i++) {
+        int rc = kh_read_line(hosts, lines[i]);
+        if(rc) {
+            fprintf(stderr, "knownhost markers: failed to parse '%s': %d\n",
+                    lines[i], rc);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int test_knownhost_markers(LIBSSH2_SESSION *session)
+{
+    LIBSSH2_KNOWNHOSTS *hosts;
+    int err = 0;
+    int rc;
+    struct libssh2_knownhost *store = NULL;
+    char linebuf[512];
+    size_t outlen = 0;
+
+    /* --- 1. plain, unmarked entries keep their historical behavior --- */
+    hosts = libssh2_knownhost_init(session);
+    if(!hosts) {
+        fprintf(stderr, "knownhost markers: init failed\n");
+        return 1;
+    }
+
+    snprintf(linebuf, sizeof(linebuf), "plain.example %s %s",
+             KH_KEY_TYPE, KH_KEY_BLOB);
+    err |= kh_read_line(hosts, linebuf) ? 1 : 0;
+    if(kh_check(hosts, "plain.example", KH_KEY_BLOB) !=
+       LIBSSH2_KNOWNHOST_CHECK_MATCH) {
+        fprintf(stderr, "knownhost markers: plain entry did not match\n");
+        err++;
+    }
+    if(kh_check(hosts, "plain.example", KH_KEY_OTHER) !=
+       LIBSSH2_KNOWNHOST_CHECK_MISMATCH) {
+        fprintf(stderr, "knownhost markers: plain entry did not mismatch\n");
+        err++;
+    }
+    if(kh_check(hosts, "other.example", KH_KEY_BLOB) !=
+       LIBSSH2_KNOWNHOST_CHECK_NOTFOUND) {
+        fprintf(stderr, "knownhost markers: unknown host not NOTFOUND\n");
+        err++;
+    }
+    libssh2_knownhost_free(hosts);
+
+    /* --- 2. a revoked key is never trusted, even with a plain match --- */
+    {
+        /* the same host+key appears once plain and once revoked, in both
+           possible orders; the verdict must be identical */
+        const char *order_revoked_first[] = {
+            "@revoked revoked.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            "revoked.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+        };
+        const char *order_plain_first[] = {
+            "revoked.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            "@revoked revoked.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+        };
+        int order;
+
+        for(order = 0; order < 2; order++) {
+            const char *const *lines = order ? order_plain_first
+                                             : order_revoked_first;
+            hosts = libssh2_knownhost_init(session);
+            err |= kh_read_all(hosts, lines, 2);
+            rc = kh_check(hosts, "revoked.example", KH_KEY_BLOB);
+            if(rc != LIBSSH2_KNOWNHOST_CHECK_MISMATCH) {
+                fprintf(stderr,
+                        "knownhost markers: revoked key trusted (order %d, "
+                        "rc=%d)\n", order, rc);
+                err++;
+            }
+            /* the returned store must point at the revoked record */
+            rc = libssh2_knownhost_check(hosts, "revoked.example",
+                                         KH_KEY_BLOB,
+                                         strlen(KH_KEY_BLOB), KH_TYPEMASK,
+                                         &store);
+            if(rc != LIBSSH2_KNOWNHOST_CHECK_MISMATCH || !store) {
+                fprintf(stderr,
+                        "knownhost markers: revoked mismatch store wrong\n");
+                err++;
+            }
+            libssh2_knownhost_free(hosts);
+        }
+    }
+
+    /* --- 3. a revoked *different* key does not trust the presented key --- */
+    hosts = libssh2_knownhost_init(session);
+    snprintf(linebuf, sizeof(linebuf),
+             "@revoked revoked-other.example %s %s", KH_KEY_TYPE,
+             KH_KEY_OTHER);
+    err |= kh_read_line(hosts, linebuf) ? 1 : 0;
+    /* a stored entry matches this host but the key differs: this must stay a
+       (safe) mismatch, never a match, and not be confused with not-found */
+    if(kh_check(hosts, "revoked-other.example", KH_KEY_BLOB) !=
+       LIBSSH2_KNOWNHOST_CHECK_MISMATCH) {
+        fprintf(stderr,
+                "knownhost markers: non-matching revoked key changed verdict\n");
+        err++;
+    }
+    /* but the revoked blob itself is, of course, still untrusted */
+    if(kh_check(hosts, "revoked-other.example", KH_KEY_OTHER) !=
+       LIBSSH2_KNOWNHOST_CHECK_MISMATCH) {
+        fprintf(stderr,
+                "knownhost markers: revoked blob reported trusted\n");
+        err++;
+    }
+    libssh2_knownhost_free(hosts);
+
+    /* --- 4. a cert-authority entry never matches as a plain host key --- */
+    /* 4a. a CA entry on its own cannot authenticate a presented host key */
+    {
+        const char *line =
+            "@cert-authority ca.example " KH_KEY_TYPE " " KH_KEY_BLOB;
+        hosts = libssh2_knownhost_init(session);
+        err |= kh_read_line(hosts, line) ? 1 : 0;
+        if(kh_check(hosts, "ca.example", KH_KEY_BLOB) !=
+           LIBSSH2_KNOWNHOST_CHECK_NOTFOUND) {
+            fprintf(stderr,
+                    "knownhost markers: CA entry matched as a plain key\n");
+            err++;
+        }
+        libssh2_knownhost_free(hosts);
+    }
+    /* 4b. with a normal entry for the same host, the CA entry must not take
+       part in plain-key matching while the normal entry still works */
+    {
+        const char *lines[] = {
+            "@cert-authority ca.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            /* a normal entry for the same host must still be able to match */
+            "ca.example " KH_KEY_TYPE " " KH_KEY_OTHER,
+        };
+        hosts = libssh2_knownhost_init(session);
+        err |= kh_read_all(hosts, lines, 2);
+        /* the CA's own blob is not a trusted plain key; the only plain entry
+           for this host carries a different blob, so this is a mismatch */
+        if(kh_check(hosts, "ca.example", KH_KEY_BLOB) !=
+           LIBSSH2_KNOWNHOST_CHECK_MISMATCH) {
+            fprintf(stderr,
+                    "knownhost markers: CA entry matched as a plain key\n");
+            err++;
+        }
+        if(kh_check(hosts, "ca.example", KH_KEY_OTHER) !=
+           LIBSSH2_KNOWNHOST_CHECK_MATCH) {
+            fprintf(stderr,
+                    "knownhost markers: plain entry shadowed by CA entry\n");
+            err++;
+        }
+        libssh2_knownhost_free(hosts);
+    }
+
+    /* --- 5. combined marker line, in both accepted spellings. A line that
+              carries cert-authority never matches a plain host key (the
+              revocation of a CA key only applies when validating a
+              certificate), so the verdict is not-found -- still untrusted. */
+    {
+        const char *lines[] = {
+            "@cert-authority,revoked both.example " KH_KEY_TYPE " "
+            KH_KEY_BLOB,
+            "@revoked,cert-authority both2.example " KH_KEY_TYPE " "
+            KH_KEY_BLOB,
+        };
+        hosts = libssh2_knownhost_init(session);
+        err |= kh_read_all(hosts, lines, 2);
+        if(kh_check(hosts, "both.example", KH_KEY_BLOB) !=
+           LIBSSH2_KNOWNHOST_CHECK_NOTFOUND) {
+            fprintf(stderr, "knownhost markers: combined marker plain-matched\n");
+            err++;
+        }
+        if(kh_check(hosts, "both2.example", KH_KEY_BLOB) !=
+           LIBSSH2_KNOWNHOST_CHECK_NOTFOUND) {
+            fprintf(stderr,
+                    "knownhost markers: reversed combined marker plain-matched\n");
+            err++;
+        }
+        libssh2_knownhost_free(hosts);
+    }
+
+    /* --- 6. unknown or incomplete marker lines are rejected outright and
+              never enter the trust collection --- */
+    {
+        const char *bad_lines[] = {
+            "@",
+            "@ ",
+            "@revoked",
+            "@revoked ",
+            "@bogus bad.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            "@revoked,bogus bad.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            "@revoked, bad.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            "@,revoked bad.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            "@revoked@x bad.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+        };
+        size_t i;
+        for(i = 0; i < sizeof(bad_lines) / sizeof(bad_lines[0]); i++) {
+            hosts = libssh2_knownhost_init(session);
+            rc = kh_read_line(hosts, bad_lines[i]);
+            if(rc == LIBSSH2_ERROR_NONE) {
+                fprintf(stderr,
+                        "knownhost markers: bad marker accepted: '%s'\n",
+                        bad_lines[i]);
+                err++;
+            }
+            /* nothing must have been stored */
+            store = NULL;
+            if(libssh2_knownhost_get(hosts, &store, NULL) != 1) {
+                fprintf(stderr,
+                        "knownhost markers: rejected marker entered store: "
+                        "'%s'\n", bad_lines[i]);
+                err++;
+            }
+            libssh2_knownhost_free(hosts);
+        }
+    }
+
+    /* --- 7. round trip: markers survive write-back and keep matching --- */
+    {
+        const char *lines[] = {
+            "@revoked rt.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            "@cert-authority rtca.example " KH_KEY_TYPE " " KH_KEY_BLOB,
+            "rtplain.example " KH_KEY_TYPE " " KH_KEY_OTHER,
+        };
+        LIBSSH2_KNOWNHOSTS *reloaded;
+        struct libssh2_knownhost *entry = NULL;
+        const char *expect_prefix[] = {
+            "@revoked ",
+            "@cert-authority ",
+            "",
+        };
+        int i;
+
+        hosts = libssh2_knownhost_init(session);
+        err |= kh_read_all(hosts, lines, 3);
+
+        i = 0;
+        entry = NULL;
+        while(libssh2_knownhost_get(hosts, &entry, entry) == 0) {
+            rc = libssh2_knownhost_writeline(hosts, entry, linebuf,
+                                             sizeof(linebuf), &outlen,
+                                             LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+            if(rc) {
+                fprintf(stderr,
+                        "knownhost markers: writeline failed: %d\n", rc);
+                err++;
+                break;
+            }
+            if(strncmp(linebuf, expect_prefix[i],
+                       strlen(expect_prefix[i]))) {
+                fprintf(stderr,
+                        "knownhost markers: marker lost on write: '%s'\n",
+                        linebuf);
+                err++;
+            }
+            i++;
+            if(i >= 3)
+                break;
+        }
+        if(i != 3) {
+            fprintf(stderr, "knownhost markers: expected 3 stored entries\n");
+            err++;
+        }
+
+        /* reload every written line into a fresh collection and confirm the
+           check verdicts are unchanged */
+        reloaded = libssh2_knownhost_init(session);
+        entry = NULL;
+        while(libssh2_knownhost_get(hosts, &entry, entry) == 0) {
+            rc = libssh2_knownhost_writeline(hosts, entry, linebuf,
+                                             sizeof(linebuf), &outlen,
+                                             LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+            if(rc || kh_read_line(reloaded, linebuf)) {
+                fprintf(stderr,
+                        "knownhost markers: round-trip parse failed\n");
+                err++;
+                break;
+            }
+        }
+        if(kh_check(reloaded, "rt.example", KH_KEY_BLOB) !=
+           LIBSSH2_KNOWNHOST_CHECK_MISMATCH) {
+            fprintf(stderr, "knownhost markers: round-trip revoked changed\n");
+            err++;
+        }
+        if(kh_check(reloaded, "rtca.example", KH_KEY_BLOB) !=
+           LIBSSH2_KNOWNHOST_CHECK_NOTFOUND) {
+            fprintf(stderr, "knownhost markers: round-trip CA changed\n");
+            err++;
+        }
+        if(kh_check(reloaded, "rtplain.example", KH_KEY_OTHER) !=
+           LIBSSH2_KNOWNHOST_CHECK_MATCH) {
+            fprintf(stderr, "knownhost markers: round-trip plain changed\n");
+            err++;
+        }
+        libssh2_knownhost_free(reloaded);
+        libssh2_knownhost_free(hosts);
+    }
+
+    /* --- 8. hashed host names keep working, also when marked revoked --- */
+    hosts = libssh2_knownhost_init(session);
+    snprintf(linebuf, sizeof(linebuf),
+             "@revoked %s %s %s", KH_HASHED_HOST, KH_KEY_TYPE, KH_KEY_BLOB);
+    err |= kh_read_line(hosts, linebuf) ? 1 : 0;
+    if(kh_check(hosts, "example.com", KH_KEY_BLOB) !=
+       LIBSSH2_KNOWNHOST_CHECK_MISMATCH) {
+        fprintf(stderr,
+                "knownhost markers: hashed revoked entry did not revoke\n");
+        err++;
+    }
+    libssh2_knownhost_free(hosts);
+
+    return err > 0;
+}
+
 static int test_ssh2_dh_validate(void)
 {
     struct tbn {
@@ -713,6 +1065,7 @@ int main(int argc, char *argv[])
 
     rc = test_ssh2_base64_decode(session);
     rc |= test_knownhost_ipv6(session);
+    rc |= test_knownhost_markers(session);
     rc |= test_ssh2_dh_validate();
     rc |= test_ssh2_bn_from_bin();
     rc |= test_ssh2_scp_parse_c_fields();

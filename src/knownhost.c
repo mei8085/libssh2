@@ -35,6 +35,16 @@
 
 /* https://man.openbsd.org/sshd.8#SSH_KNOWN_HOSTS_FILE_FORMAT */
 
+/*
+ * OpenSSH known_hosts marker prefixes. A marker is a comma-separated list of
+ * these keywords introduced by '@', e.g. "@revoked" or
+ * "@cert-authority,revoked". They change the trust semantics of the line.
+ */
+#define KNOWNHOST_MARKER_REVOKED        1u
+#define KNOWNHOST_MARKER_CERT_AUTHORITY 2u
+#define KNOWNHOST_MARKER_ALL            (KNOWNHOST_MARKER_REVOKED | \
+                                         KNOWNHOST_MARKER_CERT_AUTHORITY)
+
 struct known_host {
     struct list_node node;
     char *name;          /* points to the name or the hash (allocated) */
@@ -42,6 +52,8 @@ struct known_host {
     int port;            /* if non-zero, a specific port this key is for on
                             this host */
     int typemask;        /* plain, SHA1, custom, ... */
+    unsigned int marker; /* zero, or a bitmask of KNOWNHOST_MARKER_* values,
+                            parsed from the line's marker prefix */
     char *salt;          /* points to binary salt (allocated) */
     size_t salt_len;     /* size of salt */
     char *key;           /* the (allocated) associated key. This is kept base64
@@ -128,7 +140,8 @@ static int knownhost_add(LIBSSH2_KNOWNHOSTS *hosts,
                          const char *key_type_name, size_t key_type_len,
                          const char *key, size_t keylen,
                          const char *comment, size_t commentlen,
-                         int typemask, struct libssh2_knownhost **store)
+                         int typemask, unsigned int marker,
+                         struct libssh2_knownhost **store)
 {
     struct known_host *entry;
     size_t hostlen;
@@ -156,12 +169,18 @@ static int knownhost_add(LIBSSH2_KNOWNHOSTS *hosts,
         return ssh2_err(hosts->session, LIBSSH2_ERROR_INVAL,
                         "No key type set");
 
+    /* only known marker bits may be stored */
+    if(marker & ~KNOWNHOST_MARKER_ALL)
+        return ssh2_err(hosts->session, LIBSSH2_ERROR_INVAL,
+                        "Unknown known-hosts marker");
+
     entry = SSH2_CALLOC(hosts->session, sizeof(*entry));
     if(!entry)
         return ssh2_err(hosts->session, LIBSSH2_ERROR_ALLOC,
                         "Unable to allocate memory for known host entry");
 
     entry->typemask = typemask;
+    entry->marker = marker;
 
     switch(entry->typemask & LIBSSH2_KNOWNHOST_TYPE_MASK) {
     case LIBSSH2_KNOWNHOST_TYPE_PLAIN:
@@ -324,7 +343,7 @@ int libssh2_knownhost_add(LIBSSH2_KNOWNHOSTS *hosts,
                           int typemask, struct libssh2_knownhost **store)
 {
     return knownhost_add(hosts, host, salt, NULL, 0, key, keylen, NULL,
-                         0, typemask, store);
+                         0, typemask, 0, store);
 }
 #endif
 
@@ -356,7 +375,7 @@ int libssh2_knownhost_addc(LIBSSH2_KNOWNHOSTS *hosts,
                            int typemask, struct libssh2_knownhost **store)
 {
     return knownhost_add(hosts, host, salt, NULL, 0, key, keylen,
-                         comment, commentlen, typemask, store);
+                         comment, commentlen, typemask, 0, store);
 }
 
 /*
@@ -582,6 +601,8 @@ static int knownhost_check(LIBSSH2_KNOWNHOSTS *hosts,
 {
     struct known_host *node;
     struct known_host *badkey = NULL;
+    struct known_host *matched = NULL;
+    struct known_host *revokednode = NULL;
     int type = typemask & LIBSSH2_KNOWNHOST_TYPE_MASK;
     char *keyalloc = NULL;
     int rc = LIBSSH2_KNOWNHOST_CHECK_NOTFOUND;
@@ -644,45 +665,50 @@ static int knownhost_check(LIBSSH2_KNOWNHOSTS *hosts,
     do {
         node = ssh2_list_first(&hosts->head);
         while(node) {
-            switch(node->typemask & LIBSSH2_KNOWNHOST_TYPE_MASK) {
-            case LIBSSH2_KNOWNHOST_TYPE_PLAIN:
-                if(type == LIBSSH2_KNOWNHOST_TYPE_PLAIN)
-                    match = knownhost_plain_match(host, node->name);
-                break;
-            case LIBSSH2_KNOWNHOST_TYPE_CUSTOM:
-                if(type == LIBSSH2_KNOWNHOST_TYPE_CUSTOM)
-                    match = !strcmp(host, node->name);
-                break;
-            case LIBSSH2_KNOWNHOST_TYPE_SHA1:
-                if(type == LIBSSH2_KNOWNHOST_TYPE_PLAIN) {
-                    /* when we have the SHA1 version stored, we can use a
-                       plain input to produce a hash to compare with the
-                       stored hash. */
-                    unsigned char hash[SSH2_SHA1_DIG_LEN];
-                    ssh2_hmac_ctx ctx;
+            /* A certificate-authority entry can only authenticate host
+               certificates, never a plain host key, so it must never take
+               part in the plain host key matching below. */
+            if(!(node->marker & KNOWNHOST_MARKER_CERT_AUTHORITY)) {
+                switch(node->typemask & LIBSSH2_KNOWNHOST_TYPE_MASK) {
+                case LIBSSH2_KNOWNHOST_TYPE_PLAIN:
+                    if(type == LIBSSH2_KNOWNHOST_TYPE_PLAIN)
+                        match = knownhost_plain_match(host, node->name);
+                    break;
+                case LIBSSH2_KNOWNHOST_TYPE_CUSTOM:
+                    if(type == LIBSSH2_KNOWNHOST_TYPE_CUSTOM)
+                        match = !strcmp(host, node->name);
+                    break;
+                case LIBSSH2_KNOWNHOST_TYPE_SHA1:
+                    if(type == LIBSSH2_KNOWNHOST_TYPE_PLAIN) {
+                        /* when we have the SHA1 version stored, we can use a
+                           plain input to produce a hash to compare with the
+                           stored hash. */
+                        unsigned char hash[SSH2_SHA1_DIG_LEN];
+                        ssh2_hmac_ctx ctx;
 
-                    if(node->name_len != sizeof(hash))
-                        /* the name hash length must be the SHA1 size or
-                           we cannot match it */
-                        break;
-                    if(!ssh2_hmac_ctx_init(&ctx))
-                        break;
-                    if(!ssh2_hmac_init(&ctx, SSH2_SHA1_HMAC,
-                                       node->salt, node->salt_len) ||
-                       !ssh2_hmac_update(&ctx, host, strlen(host)) ||
-                       !ssh2_hmac_final(&ctx, hash, sizeof(hash))) {
+                        if(node->name_len != sizeof(hash))
+                            /* the name hash length must be the SHA1 size or
+                               we cannot match it */
+                            break;
+                        if(!ssh2_hmac_ctx_init(&ctx))
+                            break;
+                        if(!ssh2_hmac_init(&ctx, SSH2_SHA1_HMAC,
+                                           node->salt, node->salt_len) ||
+                           !ssh2_hmac_update(&ctx, host, strlen(host)) ||
+                           !ssh2_hmac_final(&ctx, hash, sizeof(hash))) {
+                            ssh2_hmac_cleanup(&ctx);
+                            break;
+                        }
                         ssh2_hmac_cleanup(&ctx);
-                        break;
-                    }
-                    ssh2_hmac_cleanup(&ctx);
 
-                    if(!memcmp(hash, node->name, sizeof(hash)))
-                        /* this is a node we are interested in */
-                        match = 1;
+                        if(!memcmp(hash, node->name, sizeof(hash)))
+                            /* this is a node we are interested in */
+                            match = 1;
+                    }
+                    break;
+                default: /* unsupported type */
+                    break;
                 }
-                break;
-            default: /* unsupported type */
-                break;
             }
             if(match) {
                 int host_key_type = typemask & LIBSSH2_KNOWNHOST_KEY_MASK;
@@ -698,11 +724,15 @@ static int knownhost_check(LIBSSH2_KNOWNHOSTS *hosts,
                     /* hostname and key type match, now compare the keys */
                     if(!strcmp(key, node->key)) {
                         /* they match! */
-                        if(store)
-                            *store = knownhost_to_external(node);
-                        badkey = NULL;
-                        rc = LIBSSH2_KNOWNHOST_CHECK_MATCH;
-                        break;
+                        if(node->marker & KNOWNHOST_MARKER_REVOKED) {
+                            /* a revoked key is never trustworthy, even if a
+                               plain entry for the same host and key also
+                               exists; remember it and keep scanning */
+                            if(!revokednode)
+                                revokednode = node;
+                        }
+                        else if(!matched)
+                            matched = node;
                     }
                     else {
                         /* remember the first node that had a host match but a
@@ -717,9 +747,22 @@ static int knownhost_check(LIBSSH2_KNOWNHOSTS *hosts,
             node = ssh2_list_next(&node->node);
         }
         host = hostp;
-    } while(!match && --numcheck);
+    } while(--numcheck > 0);
 
-    if(badkey) {
+    /* The final verdict does not depend on the order of the stored records:
+       a revoked key wins over every plain match, an exact match wins over a
+       mere key mismatch, and otherwise we report a mismatch or not-found. */
+    if(revokednode) {
+        if(store)
+            *store = knownhost_to_external(revokednode);
+        rc = LIBSSH2_KNOWNHOST_CHECK_MISMATCH;
+    }
+    else if(matched) {
+        if(store)
+            *store = knownhost_to_external(matched);
+        rc = LIBSSH2_KNOWNHOST_CHECK_MATCH;
+    }
+    else if(badkey) {
         /* key mismatch */
         if(store)
             *store = knownhost_to_external(badkey);
@@ -847,7 +890,8 @@ static int knownhost_line_legacy(LIBSSH2_KNOWNHOSTS *hosts,
                                  size_t key_type_len,
                                  const char *key, size_t keylen,
                                  int key_type,
-                                 const char *comment, size_t commentlen)
+                                 const char *comment, size_t commentlen,
+                                 unsigned int marker)
 {
     int rc = 0;
     size_t namelen = 0;
@@ -883,7 +927,8 @@ static int knownhost_line_legacy(LIBSSH2_KNOWNHOSTS *hosts,
                                key, keylen,
                                comment, commentlen,
                                key_type | LIBSSH2_KNOWNHOST_TYPE_PLAIN |
-                               LIBSSH2_KNOWNHOST_KEYENC_BASE64, NULL);
+                               LIBSSH2_KNOWNHOST_KEYENC_BASE64,
+                               marker, NULL);
             if(rc)
                 return rc;
 
@@ -904,7 +949,8 @@ static int knownhost_line_hashed(LIBSSH2_KNOWNHOSTS *hosts,
                                  size_t key_type_len,
                                  const char *key, size_t keylen,
                                  int key_type,
-                                 const char *comment, size_t commentlen)
+                                 const char *comment, size_t commentlen,
+                                 unsigned int marker)
 {
     const char *p;
     char saltbuf[32];
@@ -949,10 +995,94 @@ static int knownhost_line_hashed(LIBSSH2_KNOWNHOSTS *hosts,
                              key, keylen,
                              comment, commentlen,
                              key_type | LIBSSH2_KNOWNHOST_TYPE_SHA1 |
-                             LIBSSH2_KNOWNHOST_KEYENC_BASE64, NULL);
+                             LIBSSH2_KNOWNHOST_KEYENC_BASE64,
+                             marker, NULL);
     }
     else
         return 0; /* XXX: This should be an error, should it not? */
+}
+
+/*
+ * Parse the optional marker field at the start of an OpenSSH known_hosts
+ * line.
+ *
+ * A marker is a single whitespace-delimited token beginning with '@' and
+ * holding a comma-separated list of marker names, e.g. "@revoked" or
+ * "@cert-authority,revoked". It changes the trust semantics of the line and
+ * must therefore be validated strictly: an unknown, empty or otherwise
+ * incomplete marker is rejected instead of being treated as an ordinary host
+ * name.
+ *
+ * On entry, 'p' points at the first non-whitespace character of the line and
+ * 'len' is the number of remaining bytes.
+ *
+ * Returns 0 when there is no marker ('*marker' stays 0 and the pointers are
+ * untouched), 1 when a valid marker was consumed, and -1 on a malformed
+ * marker. On success, *p / *len are advanced past the marker and *marker
+ * receives the bitmask of KNOWNHOST_MARKER_* flags.
+ */
+static int knownhost_parse_marker(const char **p, size_t *len,
+                                  unsigned int *marker)
+{
+    const char *start = *p;
+    const char *cur;
+    size_t remaining = *len;
+    unsigned int flags = 0;
+
+    if(!remaining || *start != '@') {
+        *marker = 0;
+        return 0;
+    }
+
+    cur = start + 1;
+    remaining--;
+
+    /* parse every comma-separated marker name; a name must be non-empty, may
+       not contain another '@' or whitespace, and must be a known marker */
+    for(;;) {
+        const char *name = cur;
+
+        while(remaining && *cur != ',' && *cur != ' ' && *cur != '\t') {
+            if(*cur == '@')
+                return -1;
+            cur++;
+            remaining--;
+        }
+
+        if(cur == name)
+            /* empty name ("@", "@,x", "@x,") */
+            return -1;
+
+        if(cur - name == 7 && !strncmp(name, "revoked", 7))
+            flags |= KNOWNHOST_MARKER_REVOKED;
+        else if(cur - name == 14 &&
+                !strncmp(name, "cert-authority", 14))
+            flags |= KNOWNHOST_MARKER_CERT_AUTHORITY;
+        else
+            /* unknown marker: refuse the whole line */
+            return -1;
+
+        if(remaining && *cur == ',') {
+            cur++;
+            remaining--;
+            continue;
+        }
+
+        break;
+    }
+
+    /* the marker token must end at a whitespace separator */
+    if(remaining && *cur != ' ' && *cur != '\t')
+        return -1;
+
+    if(!flags)
+        return -1;
+
+    *p = cur;
+    *len = remaining;
+    *marker = flags;
+
+    return 1;
 }
 
 /*
@@ -962,7 +1092,8 @@ static int knownhost_line_hashed(LIBSSH2_KNOWNHOSTS *hosts,
  */
 static int knownhost_line(LIBSSH2_KNOWNHOSTS *hosts,
                           const char *host, size_t hostlen,
-                          const char *key, size_t keylen)
+                          const char *key, size_t keylen,
+                          unsigned int marker)
 {
     const char *comment = NULL;
     const char *key_type_name = NULL;
@@ -1062,12 +1193,12 @@ static int knownhost_line(LIBSSH2_KNOWNHOSTS *hosts,
            for simplicity, we add them as separate hosts with the same key */
         return knownhost_line_legacy(hosts, host, hostlen, key_type_name,
                                      key_type_len, key, keylen, key_type,
-                                     comment, commentlen);
+                                     comment, commentlen, marker);
     else
         /* |1|[salt]|[hash] */
         return knownhost_line_hashed(hosts, host, hostlen, key_type_name,
                                      key_type_len, key, keylen, key_type,
-                                     comment, commentlen);
+                                     comment, commentlen, marker);
 }
 
 /*
@@ -1127,39 +1258,70 @@ int libssh2_knownhost_readline(LIBSSH2_KNOWNHOSTS *hosts,
     if(!len || !*cp || *cp == '#' || *cp == '\n')
         return LIBSSH2_ERROR_NONE; /* comment or empty line */
 
-    hostp = cp; /* the host part starts here */
+    {
+        unsigned int marker = 0;
+        int mrc;
 
-    /* move over the host to the separator */
-    while(len && *cp && *cp != ' ' && *cp != '\t') {
-        cp++;
-        len--;
+        /* consume and validate an optional "@revoked"/"@cert-authority"
+           marker prefix; a malformed marker is rejected instead of being
+           mistaken for a hostname */
+        mrc = knownhost_parse_marker(&cp, &len, &marker);
+        if(mrc < 0)
+            return ssh2_err(hosts->session,
+                            LIBSSH2_ERROR_METHOD_NOT_SUPPORTED,
+                            "Failed to parse known_hosts line "
+                            "(invalid marker)");
+
+        if(mrc > 0) {
+            /* skip the whitespace separating the marker from the host */
+            while(len && (*cp == ' ' || *cp == '\t')) {
+                cp++;
+                len--;
+            }
+
+            /* a marker on its own is an incomplete line */
+            if(!len || !*cp || *cp == '\n')
+                return ssh2_err(hosts->session,
+                                LIBSSH2_ERROR_METHOD_NOT_SUPPORTED,
+                                "Failed to parse known_hosts line "
+                                "(marker without host)");
+        }
+
+        hostp = cp; /* the host part starts here */
+
+        /* move over the host to the separator */
+        while(len && *cp && *cp != ' ' && *cp != '\t') {
+            cp++;
+            len--;
+        }
+
+        hostlen = cp - hostp;
+
+        /* the key starts after the whitespaces */
+        while(len && *cp && (*cp == ' ' || *cp == '\t')) {
+            cp++;
+            len--;
+        }
+
+        if(!len || !*cp) /* illegal line */
+            return ssh2_err(hosts->session,
+                            LIBSSH2_ERROR_METHOD_NOT_SUPPORTED,
+                            "Failed to parse known_hosts line");
+
+        keyp = cp; /* the key starts here */
+
+        /* check if the line (key) ends with a newline and if so kill it */
+        while(len && *cp && *cp != '\n') {
+            cp++;
+            len--;
+        }
+
+        /* key length is the parsed span, naturally excluding newline */
+        keylen = cp - keyp;
+
+        /* deal with this one host+key line */
+        rc = knownhost_line(hosts, hostp, hostlen, keyp, keylen, marker);
     }
-
-    hostlen = cp - hostp;
-
-    /* the key starts after the whitespaces */
-    while(len && *cp && (*cp == ' ' || *cp == '\t')) {
-        cp++;
-        len--;
-    }
-
-    if(!len || !*cp) /* illegal line */
-        return ssh2_err(hosts->session, LIBSSH2_ERROR_METHOD_NOT_SUPPORTED,
-                        "Failed to parse known_hosts line");
-
-    keyp = cp; /* the key starts here */
-
-    /* check if the line (key) ends with a newline and if so kill it */
-    while(len && *cp && *cp != '\n') {
-        cp++;
-        len--;
-    }
-
-    /* key length is the parsed span, naturally excluding newline */
-    keylen = cp - keyp;
-
-    /* deal with this one host+key line */
-    rc = knownhost_line(hosts, hostp, hostlen, keyp, keylen);
     if(rc)
         return rc; /* failed */
 
@@ -1221,12 +1383,34 @@ static int knownhost_writeline(LIBSSH2_KNOWNHOSTS *hosts,
 
     const char *key_type_name;
     size_t key_type_len;
+    char markerbuf[32];
+    const char *marker = "";
+    size_t marker_len = 0;
 
     /* we only support this single file type for now, bail out on all other
        attempts */
     if(type != LIBSSH2_KNOWNHOST_FILE_OPENSSH)
         return ssh2_err(hosts->session, LIBSSH2_ERROR_METHOD_NOT_SUPPORTED,
                         "Unsupported type of known-host information store");
+
+    /* rebuild the OpenSSH marker prefix; the canonical marker order puts
+       cert-authority before revoked so a round trip keeps a stable spelling */
+    if(node->marker & KNOWNHOST_MARKER_ALL) {
+        int n;
+        if(node->marker == KNOWNHOST_MARKER_CERT_AUTHORITY)
+            n = ssh2_snprintf(markerbuf, sizeof(markerbuf),
+                              "@cert-authority ");
+        else if(node->marker == KNOWNHOST_MARKER_REVOKED)
+            n = ssh2_snprintf(markerbuf, sizeof(markerbuf), "@revoked ");
+        else
+            n = ssh2_snprintf(markerbuf, sizeof(markerbuf),
+                              "@cert-authority,revoked ");
+        if(n <= 0 || (size_t)n >= sizeof(markerbuf))
+            return ssh2_err(hosts->session, LIBSSH2_ERROR_INVAL,
+                            "Unsupported known-host marker");
+        marker = markerbuf;
+        marker_len = (size_t)n;
+    }
 
     switch(node->typemask & LIBSSH2_KNOWNHOST_KEY_MASK) {
     case LIBSSH2_KNOWNHOST_KEY_RSA1:
@@ -1292,7 +1476,7 @@ static int knownhost_writeline(LIBSSH2_KNOWNHOSTS *hosts,
        anything to the buffer unless we are sure we can write everything to the
        buffer. */
 
-    required_size = strlen(node->key);
+    required_size = strlen(node->key) + marker_len;
 
     if(key_type_len)
         required_size += key_type_len + 1; /* ' ' = 1 */
@@ -1328,18 +1512,18 @@ static int knownhost_writeline(LIBSSH2_KNOWNHOSTS *hosts,
 
         if(required_size <= buflen) {
             if(node->comment && key_type_len)
-                ssh2_snprintf(buf, buflen, "|1|%s|%s %s %s %s\n", saltalloc,
-                              namealloc, key_type_name, node->key,
+                ssh2_snprintf(buf, buflen, "%s|1|%s|%s %s %s %s\n", marker,
+                              saltalloc, namealloc, key_type_name, node->key,
                               node->comment);
             else if(node->comment)
-                ssh2_snprintf(buf, buflen, "|1|%s|%s %s %s\n", saltalloc,
-                              namealloc, node->key, node->comment);
+                ssh2_snprintf(buf, buflen, "%s|1|%s|%s %s %s\n", marker,
+                              saltalloc, namealloc, node->key, node->comment);
             else if(key_type_len)
-                ssh2_snprintf(buf, buflen, "|1|%s|%s %s %s\n", saltalloc,
-                              namealloc, key_type_name, node->key);
+                ssh2_snprintf(buf, buflen, "%s|1|%s|%s %s %s\n", marker,
+                              saltalloc, namealloc, key_type_name, node->key);
             else
-                ssh2_snprintf(buf, buflen, "|1|%s|%s %s\n", saltalloc,
-                              namealloc, node->key);
+                ssh2_snprintf(buf, buflen, "%s|1|%s|%s %s\n", marker,
+                              saltalloc, namealloc, node->key);
         }
 
         SSH2_FREE(hosts->session, namealloc);
@@ -1351,16 +1535,18 @@ static int knownhost_writeline(LIBSSH2_KNOWNHOSTS *hosts,
 
         if(required_size <= buflen) {
             if(node->comment && key_type_len)
-                ssh2_snprintf(buf, buflen, "%s %s %s %s\n", node->name,
-                              key_type_name, node->key, node->comment);
-            else if(node->comment)
-                ssh2_snprintf(buf, buflen, "%s %s %s\n", node->name, node->key,
+                ssh2_snprintf(buf, buflen, "%s%s %s %s %s\n", marker,
+                              node->name, key_type_name, node->key,
                               node->comment);
+            else if(node->comment)
+                ssh2_snprintf(buf, buflen, "%s%s %s %s\n", marker, node->name,
+                              node->key, node->comment);
             else if(key_type_len)
-                ssh2_snprintf(buf, buflen, "%s %s %s\n", node->name,
+                ssh2_snprintf(buf, buflen, "%s%s %s %s\n", marker, node->name,
                               key_type_name, node->key);
             else
-                ssh2_snprintf(buf, buflen, "%s %s\n", node->name, node->key);
+                ssh2_snprintf(buf, buflen, "%s%s %s\n", marker, node->name,
+                              node->key);
         }
     }
 

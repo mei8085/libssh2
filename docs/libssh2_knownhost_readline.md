@@ -35,6 +35,12 @@ Tell libssh2 to read a buffer as it if is a line from a known hosts file.
 *LIBSSH2_KNOWNHOST_FILE_OPENSSH* is the only currently supported
 format. This file is normally found named ~/.ssh/known_hosts
 
+The optional OpenSSH marker prefix (`@revoked`, `@cert-authority`, or a
+comma-separated combination) is recognized and validated. A revoked key is
+never trusted and a certificate-authority entry never matches a plain host
+key. A line with an unknown or incomplete marker is rejected with an error
+and no entry is added.
+
 # RETURN VALUE
 
 Returns a regular libssh2 error code, where negative values are error codes

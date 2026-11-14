@@ -1,0 +1,1 @@
+/usr/bin/cc -g CMakeFiles/test_exit_status.dir/test_exit_status.c.o -o test_exit_status  librunner.a ../src/libssh2.a /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/x86_64-linux-gnu/libz.so 

@@ -1,0 +1,1 @@
+/usr/bin/cc -g CMakeFiles/test_auth_pubkey_ok_rsa_pem_sha2_512_signed.dir/test_auth_pubkey_ok_rsa_pem_sha2_512_signed.c.o -o test_auth_pubkey_ok_rsa_pem_sha2_512_signed  librunner.a ../src/libssh2.a /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/x86_64-linux-gnu/libz.so 

@@ -1,0 +1,1 @@
+/usr/bin/cc -g CMakeFiles/test_agent_forward_ok.dir/test_agent_forward_ok.c.o -o test_agent_forward_ok  librunner.a ../src/libssh2.a /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/x86_64-linux-gnu/libz.so 

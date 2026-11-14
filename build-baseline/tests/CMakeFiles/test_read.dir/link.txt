@@ -1,0 +1,1 @@
+/usr/bin/cc -g CMakeFiles/test_read.dir/test_read.c.o -o test_read  librunner.a ../src/libssh2.a /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/x86_64-linux-gnu/libz.so 

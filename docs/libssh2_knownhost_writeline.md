@@ -45,6 +45,10 @@ the null-terminator!
 *LIBSSH2_KNOWNHOST_FILE_OPENSSH* is the only currently supported
 format.
 
+Entries read with the OpenSSH `@revoked` or `@cert-authority` marker keep
+that marker, which is written back verbatim at the start of the line so a
+read/write round trip preserves both the marker and its trust semantics.
+
 # RETURN VALUE
 
 Returns a regular libssh2 error code, where negative values are error codes

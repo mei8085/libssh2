@@ -39,6 +39,13 @@ binary address, so equivalent compressed and expanded representations match.
 No DNS lookup is performed. Hostnames, custom names and hashed known-host
 entries retain their existing matching behavior.
 
+OpenSSH marker lines change the trust semantics. A key on an `@revoked`
+line is never trusted: it is reported as LIBSSH2_KNOWNHOST_CHECK_MISMATCH
+even when a separate, unmarked entry for the same host and key would match.
+An `@cert-authority` line authenticates host certificates only, so it never
+matches a plain host key here. The verdict does not depend on the order of
+the stored entries.
+
 *port* is the port number used by the host (or a negative number
 to check the generic host). If the port number is given, libssh2
 checks the key for the specific host + port number combination in

@@ -1,0 +1,5 @@
+# Hashes of file build rules.
+732772474c1e77c63233bcba60419e64 docs/CMakeFiles/libssh2-man
+9a156f22ae6d4119940f841580c25747 docs/libssh2_agent_connect.3
+55cdaff89e01a66f947ed8898b441883 tests/CMakeFiles/clean-coverage
+199e5fcb85b58f72b285f50d03fb6d9f tests/CMakeFiles/coverage

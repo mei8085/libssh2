@@ -1,0 +1,26 @@
+Start testing: Nov 14 09:55 UTC
+----------------------------------------------------------
+45/61 Testing: test_read-aes256-ctr
+45/61 Test: test_read-aes256-ctr
+Command: "/srv/fb2/mei8085/0064-libssh2-7-e0b11a89/build-baseline/tests/test_read"
+Directory: /srv/fb2/mei8085/0064-libssh2-7-e0b11a89/build-baseline/tests
+"test_read-aes256-ctr" start time: Nov 14 09:55 UTC
+Output:
+----------------------------------------------------------
+Error running command '%s build --quiet -t libssh2/openssh_server %s' (exit 256): ERROR: permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Head "http://%2Fvar%2Frun%2Fdocker.sock/_ping": dial unix /var/run/docker.sock: connect: permission denied
+
+Failed to build container image
+Cannot stop session - none started
+Cannot stop container - none started
+Cannot stop session - none started
+Cannot stop container - none started
+Command: docker build --quiet -t libssh2/openssh_server /srv/fb2/mei8085/0064-libssh2-7-e0b11a89/tests/openssh_server
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Failed.
+"test_read-aes256-ctr" end time: Nov 14 09:55 UTC
+"test_read-aes256-ctr" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Nov 14 09:55 UTC
