@@ -1819,13 +1819,13 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
                 names_packet_len -= 4;
             }
             else {
-                filename_len = (size_t)LIBSSH2_ERROR_PROTO;
+                filename_len = (size_t)LIBSSH2_ERROR_SFTP_PROTOCOL;
                 goto end;
             }
 
             filename_len = real_filename_len;
             if(filename_len >= buffer_maxlen) {
-                filename_len = (size_t)LIBSSH2_ERROR_PROTO;
+                filename_len = (size_t)LIBSSH2_ERROR_SFTP_PROTOCOL;
                 goto end;
             }
 
@@ -1837,7 +1837,7 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
                 names_packet_len -= real_filename_len;
             }
             else {
-                filename_len = (size_t)LIBSSH2_ERROR_PROTO;
+                filename_len = (size_t)LIBSSH2_ERROR_SFTP_PROTOCOL;
                 goto end;
             }
 
@@ -1847,7 +1847,7 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
                 names_packet_len -= 4;
             }
             else {
-                filename_len = (size_t)LIBSSH2_ERROR_PROTO;
+                filename_len = (size_t)LIBSSH2_ERROR_SFTP_PROTOCOL;
                 goto end;
             }
 
@@ -1856,7 +1856,7 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
 
                 if(longentry_len >= longentry_maxlen ||
                    longentry_len > names_packet_len) {
-                    filename_len = (size_t)LIBSSH2_ERROR_PROTO;
+                    filename_len = (size_t)LIBSSH2_ERROR_SFTP_PROTOCOL;
                     goto end;
                 }
 
@@ -1869,7 +1869,7 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
                 names_packet_len -= real_longentry_len;
             }
             else {
-                filename_len = (size_t)LIBSSH2_ERROR_PROTO;
+                filename_len = (size_t)LIBSSH2_ERROR_SFTP_PROTOCOL;
                 goto end;
             }
 
@@ -1884,15 +1884,21 @@ static ssize_t sftp_readdir(LIBSSH2_SFTP_HANDLE *handle, char *buffer,
                 names_packet_len -= attr_len;
             }
             else {
-                filename_len = (size_t)LIBSSH2_ERROR_PROTO;
+                filename_len = (size_t)LIBSSH2_ERROR_SFTP_PROTOCOL;
                 goto end;
             }
 
             handle->u.dir.next_name = (char *)s;
             handle->u.dir.names_packet_len = names_packet_len;
 
-            if((--handle->u.dir.names_left) == 0)
-                SSH2_FREE(session, handle->u.dir.names_packet);
+            if((--handle->u.dir.names_left) == 0) {
+                /* Last entry consumed: release the cached response and
+                 * clear the pointers, so the handle cannot reference freed
+                 * memory and the close path cannot free it a second time. */
+                SSH2_SAFEFREE(session, handle->u.dir.names_packet);
+                handle->u.dir.next_name = NULL;
+                handle->u.dir.names_packet_len = 0;
+            }
 
 end:
             /* Parse failure with names_left still > 0 would otherwise stick
@@ -1953,6 +1959,10 @@ end:
     else if(retcode == LIBSSH2_ERROR_BUFFER_TOO_SMALL) {
         if(data_len > 0)
             SSH2_FREE(session, data);
+        /* The response packet was consumed above; reset the state so the
+         * next call sends a fresh READDIR request instead of waiting for
+         * a reply to a request that is already gone. */
+        sftp->readdir_state = ssh2_NB_state_idle;
         return ssh2_err(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
                         "Status message too short");
     }
@@ -2647,8 +2657,10 @@ static int sftp_close_handle(LIBSSH2_SFTP_HANDLE *handle)
     ssh2_list_remove(&handle->node);
 
     if(handle->handle_type == LIBSSH2_SFTP_HANDLE_DIR) {
-        if(handle->u.dir.names_left)
-            SSH2_FREE(session, handle->u.dir.names_packet);
+        /* names_packet is non-NULL only while a cached readdir response
+         * is pending; free it exactly once here. */
+        if(handle->u.dir.names_packet)
+            SSH2_SAFEFREE(session, handle->u.dir.names_packet);
     }
     else if(handle->handle_type == LIBSSH2_SFTP_HANDLE_FILE) {
         if(handle->u.file.data)
