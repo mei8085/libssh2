@@ -71,6 +71,10 @@ struct sftp_packet {
 /* Increasing from 256 to 4092 since OpenSSH does not honor it. */
 #define SFTP_HANDLE_MAXLEN 4092 /* according to spec, this should be 256! */
 
+/* Frame one SFTP packet off the channel into the SFTP packet brigade.
+   Non-static so the malformed-packet tests can drive framing directly. */
+int sftp_packet_read(LIBSSH2_SFTP *sftp);
+
 struct _LIBSSH2_SFTP_HANDLE {
     struct list_node node;
 

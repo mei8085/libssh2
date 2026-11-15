@@ -56,7 +56,8 @@ CONTAINER_TESTS_STATIC = \
   test_hostkey
 
 STANDALONE_TESTS_STATIC = \
-  test_simple
+  test_simple \
+  test_malformed_packets
 
 # Copy of the above for Makefile.am.
 # Is there a way to reuse the lists above?

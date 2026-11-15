@@ -244,7 +244,7 @@ static int sftp_packet_add(LIBSSH2_SFTP *sftp,
 /*
  * Frame an SFTP packet off the channel
  */
-static int sftp_packet_read(LIBSSH2_SFTP *sftp)
+int sftp_packet_read(LIBSSH2_SFTP *sftp)
 {
     LIBSSH2_CHANNEL *channel = sftp->channel;
     LIBSSH2_SESSION *session = channel->session;
