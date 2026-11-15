@@ -603,6 +603,31 @@ static void sftp_packetlist_flush(LIBSSH2_SFTP_HANDLE *handle)
 }
 
 /*
+ * A pipelined read failed with a protocol error or the in-flight requests
+ * no longer match the confirmed read position. Discard all outstanding
+ * read requests, rebase the sent offset on the last confirmed offset and
+ * drop any buffered data so that a rejected response cannot leak into the
+ * next read.
+ */
+static void sftp_read_pipeline_reset(LIBSSH2_SFTP_HANDLE *handle)
+{
+    struct ssh2_sftp_handle_file_data *filep = &handle->u.file;
+    LIBSSH2_SESSION *session = handle->sftp->channel->session;
+
+    /* discard all pending requests, marking the sent ones as zombies */
+    sftp_packetlist_flush(handle);
+
+    /* do not inherit offsets from the discarded requests */
+    filep->offset_sent = filep->offset;
+
+    /* drop data kept for the next call, it belongs to the failed read */
+    if(filep->data_left) {
+        SSH2_SAFEFREE(session, filep->data);
+        filep->data_left = filep->data_len = 0;
+    }
+}
+
+/*
  * Size that attr with this flagset occupies when turned into a bin struct
  */
 static int sftp_attrsize(unsigned long flags)
@@ -1393,6 +1418,7 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
     struct ssh2_sftp_handle_file_data *filep = &handle->u.file;
     size_t bytes_in_buffer = 0;
     char *sliding_bufferp = buffer;
+    int offset_ceiling = FALSE;
 
     /* This function can be interrupted in three different places where it
        might need to wait for data from the network.  It returns EAGAIN to
@@ -1453,8 +1479,12 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
             /* We allow a number of bytes being requested at any given time
                without having been acked - until we reach EOF. */
 
-            /* Number of bytes asked for that have not been acked yet */
-            size_t already = (size_t)(filep->offset_sent - filep->offset);
+            /* Number of bytes asked for that have not been acked yet. The
+               sent offset must never be behind the confirmed offset, but
+               guard the subtraction so that a corrupted state cannot make
+               this number wrap. */
+            size_t already = (filep->offset_sent > filep->offset) ?
+                (size_t)(filep->offset_sent - filep->offset) : 0;
 
             size_t max_read_ahead = buffer_size * 4;
             unsigned long recv_window;
@@ -1510,12 +1540,26 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
                handle_len(4) + offset(8) + count(4) */
             uint32_t packet_len = (uint32_t)(handle->handle_len + 25);
             uint32_t request_id;
+            libssh2_uint64_t room;
 
             uint32_t size = (uint32_t)count;
             if(size < buffer_size)
                 size = (uint32_t)buffer_size;
             if(size > MAX_SFTP_READ_SIZE)
                 size = MAX_SFTP_READ_SIZE;
+
+            /* Never let a request push the sent offset past the top of
+               the 64-bit range: a read starting near the ceiling must not
+               wrap the offset of this or any following request. */
+            room = ~(libssh2_uint64_t)0 - filep->offset_sent;
+            if((libssh2_uint64_t)size > room) {
+                if(!room) {
+                    /* no offsets left to ask for without wrapping */
+                    offset_ceiling = TRUE;
+                    break;
+                }
+                size = (uint32_t)room;
+            }
 
             chunk = SSH2_ALLOC(session, packet_len +
                                sizeof(struct sftp_pipeline_chunk));
@@ -1606,6 +1650,7 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
             unsigned char *data;
             size_t data_len = 0;
             uint32_t rc32;
+            int short_read = FALSE;
 
             if(chunk->lefttosend) {
                 /* if the chunk still has data left to send, we should not wait
@@ -1642,14 +1687,12 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
 
             switch(data[0]) {
             case SSH_FXP_STATUS:
-                /* remove the chunk we processed */
-
-                ssh2_list_remove(&chunk->node);
-                SSH2_FREE(session, chunk);
-
-                /* we must remove all outstanding READ requests, as either we
-                   got an error or we are at end of file */
-                sftp_packetlist_flush(handle);
+                /* we must remove all outstanding READ requests, as either
+                   we got an error or we are at end of file; also rebase the
+                   sent offset on the confirmed position so that a following
+                   read does not inherit offsets from the discarded
+                   requests */
+                sftp_read_pipeline_reset(handle);
 
                 rc32 = ssh2_ntohu32(data + 5);
                 SSH2_FREE(session, data);
@@ -1666,12 +1709,18 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
 
             case SSH_FXP_DATA:
                 if(chunk->offset != filep->offset) {
-                    /* This could happen if the server returns less bytes than
-                       requested, which should not happen for normal files.
-                       See:
+                    /* The server responded with data for an offset that
+                       does not match the confirmed read position. Refuse
+                       the data before anything is copied to the caller's
+                       buffer and drop all in-flight requests so that the
+                       bad response cannot leak into a later read.
+                       This could happen if the server returns less bytes
+                       than requested, which should not happen for normal
+                       files.  See:
                        https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.4
                      */
                     SSH2_FREE(session, data);
+                    sftp_read_pipeline_reset(handle);
                     return ssh2_err(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
                                     "Read Packet At Unexpected Offset");
                 }
@@ -1679,6 +1728,7 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
                 rc32 = ssh2_ntohu32(data + 5);
                 if(rc32 > (data_len - 9)) {
                     SSH2_FREE(session, data);
+                    sftp_read_pipeline_reset(handle);
                     return ssh2_err(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
                                     "SFTP Protocol badness");
                 }
@@ -1688,15 +1738,21 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
                        This is a protocol violation and we do not know how to
                        deal with it. Bail out! */
                     SSH2_FREE(session, data);
+                    sftp_read_pipeline_reset(handle);
                     return ssh2_err(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
                                     "FXP_READ response too big");
                 }
 
-                if(rc32 != chunk->len)
-                    /* a short read does not imply end of file, but we must
-                       adjust the offset_sent since it was advanced with a
-                       full chunk->len before */
-                    filep->offset_sent -= (chunk->len - rc32);
+                if(rc32 != chunk->len) {
+                    /* a short read does not imply end of file, but every
+                       request still in flight was queued with offsets based
+                       on the full length of this chunk and is now stale.
+                       Rebase the sent offset on the position right after
+                       the data we actually got; the stale requests are
+                       dropped below before we look for the next chunk. */
+                    filep->offset_sent = filep->offset + rc32;
+                    short_read = TRUE;
+                }
 
                 if((bytes_in_buffer + rc32) > buffer_size) {
                     /* figure out the overlap amount */
@@ -1730,10 +1786,17 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
                 ssh2_list_remove(&chunk->node);
                 SSH2_FREE(session, chunk);
 
+                if(short_read) {
+                    /* the remaining in-flight requests have stale offsets
+                       after the short read; drop them, they get re-issued
+                       from the rebased offset on the next call */
+                    sftp_packetlist_flush(handle);
+                    chunk = NULL;
+                }
                 /* check if we have space left in the buffer
                  * and either continue to the next chunk or stop
                  */
-                if(bytes_in_buffer < buffer_size)
+                else if(bytes_in_buffer < buffer_size)
                     chunk = next;
                 else
                     chunk = NULL;
@@ -1748,6 +1811,11 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE *handle,
 
         if(bytes_in_buffer > 0)
             return bytes_in_buffer;
+
+        if(offset_ceiling)
+            /* the read position reached the top of the 64-bit offset
+               range; no more data can exist beyond it */
+            return 0;
 
         break;
 
