@@ -47,6 +47,7 @@
 #include "transport.h"
 #include "session.h"
 #include "channel.h"
+#include "packet.h"
 #include "mac.h"
 
 #ifdef _WIN32
@@ -859,6 +860,11 @@ static int session_free(LIBSSH2_SESSION *session)
     }
 
     if(session->free_state == ssh2_NB_state_created) {
+        /* Drop any half-created reverse channel from an interrupted
+           forwarded-tcpip open so no forwarding state survives the
+           session and can leak into a new one. */
+        ssh2_packet_qlstn_cleanup(session);
+
         /* !checksrc! disable EQUALSNULL 1 */
         while((ch = ssh2_list_first(&session->channels)) != NULL) {
             rc = ssh2_channel_free(ch);

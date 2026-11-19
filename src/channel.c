@@ -497,6 +497,70 @@ LIBSSH2_CHANNEL *libssh2_channel_direct_streamlocal_ex(
 }
 
 /*
+ * Authorize a server-initiated reverse channel ("forwarded-tcpip")
+ * against the forwarding destinations registered on this session.
+ *
+ * The authorization is bound to both the exact registered destination
+ * (host and port) and the identity of the session that registered it:
+ * a destination registered on a different session - or on a previous
+ * incarnation of this connection - never authorizes a channel here,
+ * so a reconnecting client cannot inherit a prior session's
+ * authorizations.
+ *
+ * Returns SSH2_FWD_AUTH_OK and stores the matching listener in
+ * '*listener' when the request is authorized. Any other result means
+ * the request must be rejected without creating a channel.
+ */
+int ssh2_channel_fwd_auth(LIBSSH2_SESSION *session,
+                          const unsigned char *host, uint32_t host_len,
+                          uint32_t port, LIBSSH2_LISTENER **listener)
+{
+    LIBSSH2_LISTENER *listn;
+    int port_seen = 0;
+    int host_seen = 0;
+
+    if(listener)
+        *listener = NULL;
+
+    /* A session that is being torn down no longer authorizes new
+       reverse channels; late requests are rejected outright. */
+    if(session->free_state != ssh2_NB_state_idle)
+        return SSH2_FWD_AUTH_SESSION_CLOSING;
+
+    for(listn = ssh2_list_first(&session->listeners); listn;
+        listn = ssh2_list_next(&listn->node)) {
+        int host_match;
+        int port_match;
+
+        /* the authorization only applies to the session that
+           registered the destination */
+        if(listn->session != session)
+            continue;
+
+        host_match = strlen(listn->host) == host_len &&
+                     !memcmp(listn->host, host, host_len);
+        port_match = listn->port == (int)port;
+
+        if(host_match && port_match) {
+            if(listener)
+                *listener = listn;
+            return SSH2_FWD_AUTH_OK;
+        }
+
+        if(port_match)
+            port_seen = 1;
+        if(host_match)
+            host_seen = 1;
+    }
+
+    if(host_seen)
+        return SSH2_FWD_AUTH_PORT_MISMATCH;
+    if(port_seen)
+        return SSH2_FWD_AUTH_HOST_MISMATCH;
+    return SSH2_FWD_AUTH_UNREGISTERED;
+}
+
+/*
  * Bind a port on the remote host and listen for connections
  */
 static LIBSSH2_LISTENER *channel_forward_listen(LIBSSH2_SESSION *session,

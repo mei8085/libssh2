@@ -390,6 +390,21 @@ struct key_exchange_state {
 
 #define FwdNotReq "Forward not requested"
 
+/*
+ * Result of authorizing a server-initiated reverse channel
+ * ("forwarded-tcpip") against the forwarding destinations the client
+ * registered on this session. Anything but SSH2_FWD_AUTH_OK means the
+ * request must be rejected without creating a channel or leaving any
+ * forwarding state behind.
+ */
+enum ssh2_fwd_auth_result {
+    SSH2_FWD_AUTH_OK = 0,        /* exact match with a registered listener */
+    SSH2_FWD_AUTH_UNREGISTERED,  /* no registered destination at all */
+    SSH2_FWD_AUTH_HOST_MISMATCH, /* port registered, address differs */
+    SSH2_FWD_AUTH_PORT_MISMATCH, /* address registered, port differs */
+    SSH2_FWD_AUTH_SESSION_CLOSING /* late request, session is closing */
+};
+
 struct packet_queue_listener_state {
     ssh2_NB_states state;
     unsigned char packet[17 + sizeof(FwdNotReq) - 1];
@@ -403,6 +418,8 @@ struct packet_queue_listener_state {
     uint32_t host_len;
     uint32_t shost_len;
     LIBSSH2_CHANNEL *channel;
+    LIBSSH2_LISTENER *listener; /* the registered destination that
+                                   authorized this reverse channel */
 };
 
 #define X11FwdUnAvil "X11 Forward Unavailable"

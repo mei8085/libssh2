@@ -112,4 +112,17 @@ int ssh2_channel_close(LIBSSH2_CHANNEL *channel);
  */
 int ssh2_channel_forward_cancel(LIBSSH2_LISTENER *listener);
 
+/*
+ * Authorize a server-initiated reverse channel ("forwarded-tcpip")
+ * against the forwarding destinations registered on this session.
+ *
+ * Returns SSH2_FWD_AUTH_OK and stores the authorizing listener in
+ * '*listener' when the request targets a destination registered on
+ * this very session. Any other enum ssh2_fwd_auth_result value means
+ * the request must be rejected without creating a channel.
+ */
+int ssh2_channel_fwd_auth(LIBSSH2_SESSION *session,
+                          const unsigned char *host, uint32_t host_len,
+                          uint32_t port, LIBSSH2_LISTENER **listener);
+
 #endif /* LIBSSH2_CHANNEL_H */

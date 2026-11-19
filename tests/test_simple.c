@@ -33,6 +33,7 @@
 
 #include "libssh2_priv.h"
 #include "libssh2_sftp.h"
+#include "channel.h"
 #include "sftp.h"
 #include "transport.h"
 
@@ -636,6 +637,123 @@ static int test_sftp_mkdir_resume_fail_cleanup(void)
     return err > 0;
 }
 
+static int test_fwd_auth_one(LIBSSH2_SESSION *session,
+                             const char *host, uint32_t port,
+                             int expected, const char *what)
+{
+    int got = ssh2_channel_fwd_auth(session, (const unsigned char *)host,
+                                    (uint32_t)strlen(host), port, NULL);
+    if(got != expected) {
+        fprintf(stderr, "fwd_auth %s: got %d, want %d\n",
+                what, got, expected);
+        return 1;
+    }
+    return 0;
+}
+
+static LIBSSH2_LISTENER *test_fwd_auth_add_listener(LIBSSH2_SESSION *session,
+                                                    const char *host,
+                                                    int port)
+{
+    LIBSSH2_LISTENER *listn = SSH2_CALLOC(session, sizeof(*listn));
+
+    if(listn) {
+        listn->host = SSH2_ALLOC(session, strlen(host) + 1);
+        if(!listn->host) {
+            SSH2_FREE(session, listn);
+            return NULL;
+        }
+        strcpy(listn->host, host);
+        listn->port = port;
+        listn->session = session;
+        ssh2_list_add(&session->listeners, &listn->node);
+    }
+    return listn;
+}
+
+static void test_fwd_auth_free_listener(LIBSSH2_LISTENER *listn)
+{
+    LIBSSH2_SESSION *session = listn->session;
+
+    ssh2_list_remove(&listn->node);
+    SSH2_FREE(session, listn->host);
+    SSH2_FREE(session, listn);
+}
+
+static int test_fwd_auth(LIBSSH2_SESSION *session)
+{
+    LIBSSH2_SESSION *other = NULL;
+    LIBSSH2_LISTENER *listn = NULL;
+    LIBSSH2_LISTENER *other_listn = NULL;
+    LIBSSH2_LISTENER *matched = NULL;
+    int err = 0;
+
+    /* nothing registered: any target is unregistered */
+    err |= test_fwd_auth_one(session, "example.com", 8080,
+                             SSH2_FWD_AUTH_UNREGISTERED, "no listeners");
+
+    listn = test_fwd_auth_add_listener(session, "example.com", 8080);
+    if(!listn) {
+        fprintf(stderr, "fwd_auth: listener setup failed\n");
+        return 1;
+    }
+
+    /* exact registered destination is authorized, bound to its listener */
+    if(ssh2_channel_fwd_auth(session, (const unsigned char *)"example.com",
+                             11, 8080, &matched) != SSH2_FWD_AUTH_OK ||
+       matched != listn) {
+        fprintf(stderr, "fwd_auth: exact match not authorized\n");
+        err++;
+    }
+
+    err |= test_fwd_auth_one(session, "example.com", 9090,
+                             SSH2_FWD_AUTH_PORT_MISMATCH,
+                             "registered address, other port");
+    err |= test_fwd_auth_one(session, "other.org", 8080,
+                             SSH2_FWD_AUTH_HOST_MISMATCH,
+                             "registered port, other address");
+    err |= test_fwd_auth_one(session, "other.org", 9090,
+                             SSH2_FWD_AUTH_UNREGISTERED,
+                             "unregistered address and port");
+
+    /* a destination registered on another session must not authorize
+       channels on this session */
+    other = libssh2_session_init();
+    if(!other) {
+        fprintf(stderr, "fwd_auth: second session init failed\n");
+        err++;
+        goto done;
+    }
+    other_listn = test_fwd_auth_add_listener(other, "other.org", 9090);
+    if(!other_listn) {
+        fprintf(stderr, "fwd_auth: other listener setup failed\n");
+        err++;
+        goto done;
+    }
+    err |= test_fwd_auth_one(session, "other.org", 9090,
+                             SSH2_FWD_AUTH_UNREGISTERED,
+                             "destination of another session");
+    err |= test_fwd_auth_one(other, "other.org", 9090,
+                             SSH2_FWD_AUTH_OK,
+                             "owning session stays authorized");
+
+    /* a session that is being torn down rejects late requests */
+    session->free_state = ssh2_NB_state_created;
+    err |= test_fwd_auth_one(session, "example.com", 8080,
+                             SSH2_FWD_AUTH_SESSION_CLOSING,
+                             "late request on closing session");
+    session->free_state = ssh2_NB_state_idle;
+
+done:
+    if(other_listn)
+        test_fwd_auth_free_listener(other_listn);
+    if(other)
+        libssh2_session_free(other);
+    test_fwd_auth_free_listener(listn);
+
+    return err > 0;
+}
+
 static const unsigned char *transport_feed;
 static size_t transport_feed_len;
 
@@ -726,6 +844,8 @@ int main(int argc, char *argv[])
 #endif
 
     rc |= test_transport_empty_payload();
+
+    rc |= test_fwd_auth(session);
 
     libssh2_session_free(session);
 

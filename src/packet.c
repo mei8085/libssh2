@@ -44,6 +44,39 @@
 #include "packet.h"
 
 /*
+ * Free a half-created reverse channel that never got confirmed or
+ * queued, so a rejected or failed authorization leaves no forwarding
+ * state behind.
+ */
+static void packet_queue_listener_free_channel(
+    LIBSSH2_SESSION *session,
+    struct packet_queue_listener_state *listen_state)
+{
+    LIBSSH2_CHANNEL *channel = listen_state->channel;
+
+    if(channel) {
+        if(channel->channel_type)
+            SSH2_FREE(session, channel->channel_type);
+        SSH2_FREE(session, channel);
+        listen_state->channel = NULL;
+    }
+}
+
+/*
+ * Drop any pending reverse channel authorization state, e.g. a
+ * half-created channel from an interrupted forwarded-tcpip open.
+ * Called when the session is torn down so that nothing from this
+ * session can leak into a new one.
+ */
+void ssh2_packet_qlstn_cleanup(LIBSSH2_SESSION *session)
+{
+    packet_queue_listener_free_channel(session,
+                                       &session->packAdd_Qlstn_state);
+    session->packAdd_Qlstn_state.listener = NULL;
+    session->packAdd_Qlstn_state.state = ssh2_NB_state_idle;
+}
+
+/*
  * Queue a connection request for a listener
  */
 static SSH2_INLINE int packet_queue_listener(
@@ -51,13 +84,9 @@ static SSH2_INLINE int packet_queue_listener(
     unsigned char *data, size_t datalen,
     struct packet_queue_listener_state *listen_state)
 {
-    /*
-     * Look for a matching listener
-     */
     /* 17 = packet_type(1) + channel(4) + reason(4) + descr(4) + lang(4) */
     size_t packet_len = 17 + strlen(FwdNotReq);
     unsigned char *p;
-    LIBSSH2_LISTENER *listn = ssh2_list_first(&session->listeners);
     uint32_t failure_code = SSH_OPEN_ADMINISTRATIVELY_PROHIBITED;
     int rc;
 
@@ -111,126 +140,171 @@ static SSH2_INLINE int packet_queue_listener(
         listen_state->state = ssh2_NB_state_allocated;
     }
 
-    if(listen_state->state != ssh2_NB_state_sent) {
-        while(listn) {
-            if(listn->port == (int)listen_state->port &&
-               strlen(listn->host) == listen_state->host_len &&
-               !memcmp(listn->host, listen_state->host,
-                       listen_state->host_len)) {
-                /* This is our listener */
-                LIBSSH2_CHANNEL *channel = NULL;
+    if(listen_state->state == ssh2_NB_state_allocated) {
+        /*
+         * Authorize the server-initiated reverse channel against the
+         * forwarding destinations registered on this session. The
+         * request is bound to both the exact registered destination
+         * and this session's identity.
+         */
+        int auth = ssh2_channel_fwd_auth(session, listen_state->host,
+                                         listen_state->host_len,
+                                         listen_state->port,
+                                         &listen_state->listener);
 
-                if(listen_state->state == ssh2_NB_state_allocated) {
-                    if(listn->queue_maxsize &&
-                       (listn->queue_maxsize <= listn->queue_size)) {
-                        /* Queue is full */
-                        failure_code = SSH_OPEN_RESOURCE_SHORTAGE;
-                        ssh2_deb((session, LIBSSH2_TRACE_CONN,
-                                  "Listener queue full, ignoring"));
-                        listen_state->state = ssh2_NB_state_sent;
-                        break;
-                    }
+        if(auth != SSH2_FWD_AUTH_OK) {
+            switch(auth) {
+            case SSH2_FWD_AUTH_SESSION_CLOSING:
+                ssh2_deb((session, LIBSSH2_TRACE_CONN,
+                          "Reverse channel to %.*s:%u rejected: "
+                          "session is closing",
+                          (int)listen_state->host_len, listen_state->host,
+                          listen_state->port));
+                break;
+            case SSH2_FWD_AUTH_PORT_MISMATCH:
+                ssh2_deb((session, LIBSSH2_TRACE_CONN,
+                          "Reverse channel to %.*s:%u rejected: "
+                          "port not registered for this destination",
+                          (int)listen_state->host_len, listen_state->host,
+                          listen_state->port));
+                break;
+            case SSH2_FWD_AUTH_HOST_MISMATCH:
+                ssh2_deb((session, LIBSSH2_TRACE_CONN,
+                          "Reverse channel to %.*s:%u rejected: "
+                          "destination address not registered "
+                          "for this port",
+                          (int)listen_state->host_len, listen_state->host,
+                          listen_state->port));
+                break;
+            default:
+                ssh2_deb((session, LIBSSH2_TRACE_CONN,
+                          "Reverse channel to %.*s:%u rejected: "
+                          "no such registered forward destination",
+                          (int)listen_state->host_len, listen_state->host,
+                          listen_state->port));
+                break;
+            }
 
-                    if(!listen_state->packet_size) {
-                        ssh2_deb((session, LIBSSH2_TRACE_CONN,
-                                  "Invalid packet size received from server"));
-                        failure_code = SSH_OPEN_CONNECT_FAILED;
-                        listen_state->state = ssh2_NB_state_sent;
-                        break;
-                    }
+            listen_state->state = ssh2_NB_state_sent;
+        }
+        else {
+            LIBSSH2_LISTENER *listn = listen_state->listener;
+            LIBSSH2_CHANNEL *channel;
 
-                    channel = SSH2_CALLOC(session, sizeof(LIBSSH2_CHANNEL));
-                    if(!channel) {
-                        ssh2_err(session, LIBSSH2_ERROR_ALLOC,
-                                 "Unable to allocate a channel for "
-                                 "new connection");
-                        failure_code = SSH_OPEN_RESOURCE_SHORTAGE;
-                        listen_state->state = ssh2_NB_state_sent;
-                        break;
-                    }
+            if(listn->queue_maxsize &&
+               (listn->queue_maxsize <= listn->queue_size)) {
+                /* Queue is full */
+                failure_code = SSH_OPEN_RESOURCE_SHORTAGE;
+                ssh2_deb((session, LIBSSH2_TRACE_CONN,
+                          "Listener queue full, ignoring"));
+                listen_state->state = ssh2_NB_state_sent;
+            }
+            else if(!listen_state->packet_size) {
+                ssh2_deb((session, LIBSSH2_TRACE_CONN,
+                          "Invalid packet size received from server"));
+                failure_code = SSH_OPEN_CONNECT_FAILED;
+                listen_state->state = ssh2_NB_state_sent;
+            }
+            else {
+                channel = SSH2_CALLOC(session, sizeof(LIBSSH2_CHANNEL));
+                if(!channel) {
+                    ssh2_err(session, LIBSSH2_ERROR_ALLOC,
+                             "Unable to allocate a channel for "
+                             "new connection");
+                    failure_code = SSH_OPEN_RESOURCE_SHORTAGE;
+                    listen_state->state = ssh2_NB_state_sent;
+                }
+                else {
                     listen_state->channel = channel;
 
                     channel->session = session;
-                    channel->channel_type_len = sizeof("forwarded-tcpip") - 1;
+                    channel->channel_type_len =
+                        sizeof("forwarded-tcpip") - 1;
                     channel->channel_type =
                         SSH2_ALLOC(session, channel->channel_type_len + 1);
                     if(!channel->channel_type) {
                         ssh2_err(session, LIBSSH2_ERROR_ALLOC,
                                  "Unable to allocate a channel for "
                                  "new connection");
-                        SSH2_FREE(session, channel);
+                        packet_queue_listener_free_channel(session,
+                                                           listen_state);
                         failure_code = SSH_OPEN_RESOURCE_SHORTAGE;
                         listen_state->state = ssh2_NB_state_sent;
-                        break;
                     }
-                    memcpy(channel->channel_type, "forwarded-tcpip",
-                           channel->channel_type_len + 1);
+                    else {
+                        memcpy(channel->channel_type, "forwarded-tcpip",
+                               channel->channel_type_len + 1);
 
-                    channel->remote.id = listen_state->sender_channel;
-                    channel->remote.window_size_initial =
-                        LIBSSH2_CHANNEL_WINDOW_DEFAULT;
-                    channel->remote.window_size =
-                        LIBSSH2_CHANNEL_WINDOW_DEFAULT;
-                    channel->remote.packet_size =
-                        LIBSSH2_CHANNEL_PACKET_DEFAULT;
+                        channel->remote.id = listen_state->sender_channel;
+                        channel->remote.window_size_initial =
+                            LIBSSH2_CHANNEL_WINDOW_DEFAULT;
+                        channel->remote.window_size =
+                            LIBSSH2_CHANNEL_WINDOW_DEFAULT;
+                        channel->remote.packet_size =
+                            LIBSSH2_CHANNEL_PACKET_DEFAULT;
 
-                    channel->local.id = ssh2_channel_nextid(session);
-                    channel->local.window_size_initial =
-                        listen_state->initial_window_size;
-                    channel->local.window_size =
-                        listen_state->initial_window_size;
-                    channel->local.packet_size = listen_state->packet_size;
+                        channel->local.id = ssh2_channel_nextid(session);
+                        channel->local.window_size_initial =
+                            listen_state->initial_window_size;
+                        channel->local.window_size =
+                            listen_state->initial_window_size;
+                        channel->local.packet_size =
+                            listen_state->packet_size;
 
-                    ssh2_deb((session, LIBSSH2_TRACE_CONN,
-                              "Connection queued: channel %u/%u "
-                              "win %u/%u packet %u/%u",
-                              channel->local.id, channel->remote.id,
-                              channel->local.window_size,
-                              channel->remote.window_size,
-                              channel->local.packet_size,
-                              channel->remote.packet_size));
+                        ssh2_deb((session, LIBSSH2_TRACE_CONN,
+                                  "Connection queued: channel %u/%u "
+                                  "win %u/%u packet %u/%u",
+                                  channel->local.id, channel->remote.id,
+                                  channel->local.window_size,
+                                  channel->remote.window_size,
+                                  channel->local.packet_size,
+                                  channel->remote.packet_size));
 
-                    p = listen_state->packet;
-                    *(p++) = SSH_MSG_CHANNEL_OPEN_CONFIRMATION;
-                    ssh2_store_u32(&p, channel->remote.id);
-                    ssh2_store_u32(&p, channel->local.id);
-                    ssh2_store_u32(&p, channel->remote.window_size_initial);
-                    ssh2_store_u32(&p, channel->remote.packet_size);
+                        p = listen_state->packet;
+                        *(p++) = SSH_MSG_CHANNEL_OPEN_CONFIRMATION;
+                        ssh2_store_u32(&p, channel->remote.id);
+                        ssh2_store_u32(&p, channel->local.id);
+                        ssh2_store_u32(&p,
+                                       channel->remote.window_size_initial);
+                        ssh2_store_u32(&p, channel->remote.packet_size);
 
-                    listen_state->state = ssh2_NB_state_created;
-                }
-
-                if(listen_state->state == ssh2_NB_state_created) {
-                    rc = ssh2_transport_send(session, listen_state->packet,
-                                             17, NULL, 0);
-                    if(rc == LIBSSH2_ERROR_EAGAIN)
-                        return rc;
-                    else if(rc) {
-                        listen_state->state = ssh2_NB_state_idle;
-                        return ssh2_err(session, rc,
-                                        "Unable to send channel "
-                                        "open confirmation");
+                        listen_state->state = ssh2_NB_state_created;
                     }
-
-                    /* Link the channel into the end of the queue list */
-                    if(listen_state->channel) {
-                        ssh2_list_add(&listn->queue,
-                                      &listen_state->channel->node);
-                        listn->queue_size++;
-                    }
-
-                    listen_state->state = ssh2_NB_state_idle;
-                    return 0;
                 }
             }
-
-            listn = ssh2_list_next(&listn->node);
         }
-
-        listen_state->state = ssh2_NB_state_sent;
     }
 
-    /* We are not listening to you */
+    if(listen_state->state == ssh2_NB_state_created) {
+        rc = ssh2_transport_send(session, listen_state->packet,
+                                 17, NULL, 0);
+        if(rc == LIBSSH2_ERROR_EAGAIN)
+            return rc;
+        else if(rc) {
+            /* the confirmation could not be sent: drop the
+               half-created channel so no forwarding state remains */
+            packet_queue_listener_free_channel(session, listen_state);
+            listen_state->listener = NULL;
+            listen_state->state = ssh2_NB_state_idle;
+            return ssh2_err(session, rc,
+                            "Unable to send channel "
+                            "open confirmation");
+        }
+
+        /* Link the channel into the end of the listener's queue */
+        ssh2_list_add(&listen_state->listener->queue,
+                      &listen_state->channel->node);
+        listen_state->listener->queue_size++;
+
+        /* the listener queue owns the channel now */
+        listen_state->channel = NULL;
+        listen_state->listener = NULL;
+        listen_state->state = ssh2_NB_state_idle;
+        return 0;
+    }
+
+    /* listen_state->state == ssh2_NB_state_sent: reject the request
+       without having created a channel or any forwarding state */
     p = listen_state->packet;
     *(p++) = SSH_MSG_CHANNEL_OPEN_FAILURE;
     ssh2_store_u32(&p, listen_state->sender_channel);

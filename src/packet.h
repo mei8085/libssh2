@@ -55,4 +55,11 @@ int ssh2_packet_burn(LIBSSH2_SESSION *session, ssh2_NB_states *state);
 int ssh2_packet_add(LIBSSH2_SESSION *session, unsigned char *data,
                     size_t datalen, int macstate, uint32_t seq);
 
+/*
+ * Drop any pending reverse channel authorization state (a half-created
+ * forwarded-tcpip channel) so session teardown leaves nothing that a
+ * new session could inherit.
+ */
+void ssh2_packet_qlstn_cleanup(LIBSSH2_SESSION *session);
+
 #endif /* LIBSSH2_PACKET_H */
